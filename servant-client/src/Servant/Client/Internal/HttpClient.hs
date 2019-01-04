@@ -11,34 +11,53 @@
 {-# LANGUAGE TypeFamilies               #-}
 module Servant.Client.Internal.HttpClient where
 
-import           Prelude                     ()
+import           Prelude ()
 import           Prelude.Compat
 
 import           Control.Concurrent.STM.TVar
 import           Control.Exception
 import           Control.Monad
-import           Control.Monad.Base          (MonadBase (..))
-import           Control.Monad.Catch         (MonadCatch, MonadThrow)
-import           Control.Monad.Error.Class   (MonadError (..))
+import           Control.Monad.Base
+                 (MonadBase (..))
+import           Control.Monad.Catch
+                 (MonadCatch, MonadThrow)
+import           Control.Monad.Error.Class
+                 (MonadError (..))
+import           Control.Monad.IO.Class
+                 (liftIO)
 import           Control.Monad.Reader
-import           Control.Monad.STM           (atomically)
-import           Control.Monad.Trans.Control (MonadBaseControl (..))
+import           Control.Monad.STM
+                 (atomically)
+import           Control.Monad.Trans.Control
+                 (MonadBaseControl (..))
 import           Control.Monad.Trans.Except
-import           Data.ByteString.Builder     (toLazyByteString)
+import           Data.ByteString.Builder
+                 (toLazyByteString)
 import qualified Data.ByteString.Lazy        as BSL
-import           Data.Foldable               (toList, for_)
-import           Data.Functor.Alt            (Alt (..))
-import           Data.Maybe                  (maybeToList)
-import           Data.Semigroup              ((<>))
-import           Data.Proxy                  (Proxy (..))
-import           Data.Sequence               (fromList)
-import           Data.String                 (fromString)
+import           Data.Either
+                 (either)
+import           Data.Foldable
+                 (toList)
+import           Data.Functor.Alt
+                 (Alt (..))
+import           Data.Maybe
+                 (maybe, maybeToList)
+import           Data.Proxy
+                 (Proxy (..))
+import           Data.Semigroup
+                 ((<>))
+import           Data.Sequence
+                 (fromList)
+import           Data.String
+                 (fromString)
 import qualified Data.Text                   as T
-import           Data.Time.Clock             (getCurrentTime)
+import           Data.Time.Clock
+                 (UTCTime, getCurrentTime)
 import           GHC.Generics
-import           Network.HTTP.Media          (renderHeader)
-import           Network.HTTP.Types          (hContentType, renderQuery,
-                                              statusCode)
+import           Network.HTTP.Media
+                 (renderHeader)
+import           Network.HTTP.Types
+                 (hContentType, renderQuery, statusCode)
 import           Servant.Client.Core
 
 import qualified Network.HTTP.Client         as Client
@@ -144,19 +163,37 @@ performRequest req = do
         writeTVar cj newCookieJar
         pure newRequest
 
-  eResponse <- liftIO $ catchConnectionError $ Client.httpLbs request m
-  case eResponse of
-    Left err -> throwError err
-    Right response -> do
-      for_ cookieJar' $ \cj -> liftIO $ do
-        now' <- getCurrentTime
-        atomically $ modifyTVar' cj (fst . Client.updateCookieJar response request now')
-      let status = Client.responseStatus response
-          status_code = statusCode status
-          ourResponse = clientResponseToResponse response
-      unless (status_code >= 200 && status_code < 300) $
-        throwError $ FailureResponse ourResponse
-      return ourResponse
+  response <- maybe (requestWithoutCookieJar m request) (requestWithCookieJar m request) cookieJar'
+  let status = Client.responseStatus response
+      status_code = statusCode status
+      ourResponse = clientResponseToResponse response
+  unless (status_code >= 200 && status_code < 300) $
+      throwError $ FailureResponse ourResponse
+  return ourResponse
+  where
+    requestWithoutCookieJar :: Client.Manager -> Client.Request -> ClientM (Client.Response BSL.ByteString)
+    requestWithoutCookieJar m' request' = do
+        eResponse <- liftIO . catchConnectionError $ Client.httpLbs request' m'
+        either throwError return eResponse
+
+    requestWithCookieJar :: Client.Manager -> Client.Request -> TVar Client.CookieJar -> ClientM (Client.Response BSL.ByteString)
+    requestWithCookieJar m' request' cj = do
+        eResponse <- liftIO . catchConnectionError . Client.withResponseHistory request' m' $ updateWithResponseCookies cj
+        either throwError return eResponse
+
+    updateWithResponseCookies :: TVar Client.CookieJar -> Client.HistoriedResponse Client.BodyReader -> IO (Client.Response BSL.ByteString)
+    updateWithResponseCookies cj responses = do
+        now <- getCurrentTime
+        bss <- Client.brConsume $ Client.responseBody fRes
+        let fRes' = fRes { Client.responseBody = BSL.fromChunks bss }
+        mapM_ (updateCookieJar now) $ Client.hrRedirects responses <> [(fReq, fRes')]
+        return fRes'
+      where
+          updateCookieJar :: UTCTime -> (Client.Request, Client.Response BSL.ByteString) -> IO ()
+          updateCookieJar now' (req', res') = atomically $ modifyTVar' cj (fst . Client.updateCookieJar res' req' now')
+
+          fReq = Client.hrFinalRequest responses
+          fRes = Client.hrFinalResponse responses
 
 performStreamingRequest :: Request -> ClientM StreamingResponse
 performStreamingRequest req = do
